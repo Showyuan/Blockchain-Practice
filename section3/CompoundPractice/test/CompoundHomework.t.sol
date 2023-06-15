@@ -18,16 +18,30 @@ import { CToken } from "compound-protocol/contracts/CToken.sol";
 // token
 import { ERC20 } from "openzeppelin/token/ERC20/ERC20.sol";
 import { TestERC20 } from "../contracts/TestERC20.sol";
+import { EIP20Interface } from "compound-protocol/contracts/EIP20Interface.sol";
 // test
 import "forge-std/Test.sol";
 import "forge-std/console.sol";
+// aave
+import {
+  IFlashLoanSimpleReceiver,
+  IPoolAddressesProvider,
+  IPool
+} from "aave-v3-core/contracts/flashloan/interfaces/IFlashLoanSimpleReceiver.sol";
+// uniswap
+import { ISwapRouter } from "v3-periphery/interfaces/ISwapRouter.sol";
 
-contract CompoundHomework is Test {
+contract CompoundHomework is Test, IFlashLoanSimpleReceiver {
 
     // users
     address public admin = makeAddr("Admin");
     address public user1 = makeAddr("User1");
     address public user2 = makeAddr("User2");
+    // constants
+    address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address constant POOL_ADDRESSES_PROVIDER = 0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e;
+    address constant UNI = 0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984;
+    address constant SWAP_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
     // comptroller
     Unitroller unitroller;
     ComptrollerG7 comptrollerG7;
@@ -39,6 +53,14 @@ contract CompoundHomework is Test {
     CErc20Delegate cTokenBDelegate;
     CErc20Delegator cTokenA;
     CErc20Delegator cTokenB;
+    // usdc
+    EIP20Interface IUSDC;
+    CErc20Delegate cUsdcDelegate;
+    CErc20Delegator cUsdc;
+    // uni
+    EIP20Interface IUNI;
+    CErc20Delegate cUniDelegate;
+    CErc20Delegator cUni;
     // priceOracle
     SimplePriceOracle priceOracle;
     WhitePaperInterestRateModel whitePaper;
@@ -64,6 +86,21 @@ contract CompoundHomework is Test {
 
         // deploy TokenA
         deployTokenA();
+        // deploy USDC
+        deployUsdc();
+        // deploy UNI
+        deployUni();
+
+        // Close factor: 50%
+        unitrollerProxy._setCloseFactor(0.5e18);
+        // Liquidation incentive : 8%
+        unitrollerProxy._setLiquidationIncentive(1.08 * 1e18);
+        
+        deal(UNI, user1, 1000 * 10 ** 18); // for user1 borrow
+        deal(USDC, admin, 2500 * 10 ** 6); // for user1 borrow
+        deal(USDC, address(this), 6.25 * 10 * 6); // premium
+        IUSDC.approve(address(cUsdc), 2500 * 10 ** 6);
+        cUsdc.mint(2500 * 10 ** 6);
 
         vm.stopPrank();
     }
@@ -161,6 +198,42 @@ contract CompoundHomework is Test {
         vm.stopPrank();
     }
 
+    // forge test --fork-url https://eth-mainnet.g.alchemy.com/v2/jLiLx82EZbK1WsZ94UWWeNt27AwcGBiN --fork-block-number 17465000
+    function test_aave_flash_loan() public {
+
+        // user1 borrow tokenA
+        vm.startPrank(user1);
+
+        // let tokenB enter markets
+        address[] memory addr = new address[](1);
+        addr[0] = address(cUni);
+        unitrollerProxy.enterMarkets(addr);
+
+        // mint 1000 UNI
+        IUNI.approve(address(cUni), 1000 * 10 ** 18);
+        cUni.mint(1000 * 10 ** 18);
+
+        // borrow 2500 USDC
+        cUsdc.borrow(2500 * 10 ** 6);
+
+        vm.stopPrank();
+
+        // let User1 Shortfall
+        vm.prank(admin);
+        // $5 -> $4
+        priceOracle.setUnderlyingPrice(CToken(address(cUni)), 4e18);
+
+        // User2 user flash loan to liquidate User1
+        vm.startPrank(user2);
+
+        // AAVE: flashLoanSimple
+        // 2500 * 50% = 1250 usdc
+        POOL().flashLoanSimple(address(this), USDC, 1250 * 10 ** 6, abi.encode(0x00), 0);
+
+        // earn 63 USDC
+        console.log("Final USDC Balance: %s", EIP20Interface(USDC).balanceOf(address(this)));
+    }
+
     function deployTokenA() public {
 
         // tokenA
@@ -227,5 +300,117 @@ contract CompoundHomework is Test {
         unitrollerProxy._supportMarket(CToken(address(cTokenB)));
         // Close Factor : 50%
         unitrollerProxy._setCollateralFactor(CToken(address(cTokenB)), 0.5e18);
+    }
+
+    function deployUsdc() public {
+        IUSDC = EIP20Interface(USDC);
+        
+        cUsdcDelegate = new CErc20Delegate();
+        bytes memory data = new bytes(0x00);
+                
+        // cUsdc
+        // Exchange rate : 10 ^ (18 - cToken decimals + underlying token decimals)
+        cUsdc = new CErc20Delegator(
+            USDC,
+            ComptrollerInterface(address(unitroller)),
+            InterestRateModel(address(whitePaper)),
+            1e6,
+            "Compound USDC",
+            "cUSDC",
+            18,
+            payable(address(uint160(admin))),
+            address(cUsdcDelegate),
+            data );
+        cUsdc._setImplementation(address(cUsdcDelegate), false, data);
+
+        // Underlying Price : $1
+        // 10 ^ (36 - underlying asset decimals)
+        priceOracle.setUnderlyingPrice(CToken(address(cUsdc)), 1e30);
+        // Reserve Factor : 0%
+        cUsdc._setReserveFactor(0);
+        // support cUsdc into Market
+        unitrollerProxy._supportMarket(CToken(address(cUsdc)));
+    }
+
+    function deployUni() public {
+
+        IUNI = EIP20Interface(UNI);
+        
+        cUniDelegate = new CErc20Delegate();
+        bytes memory data = new bytes(0x00);
+
+        // cUni
+        // Exchange rate : 10 ^ (18 - cToken decimals + underlying token decimals)
+        cUni = new CErc20Delegator(
+            UNI,
+            ComptrollerInterface(address(unitroller)),
+            InterestRateModel(address(whitePaper)),
+            1e18,
+            "Compound UNI",
+            "cUNI",
+            18,
+            payable(address(uint160(admin))),
+            address(cUniDelegate),
+            data );
+        cUni._setImplementation(address(cUniDelegate), false, data);
+
+        // Underlying Price : $5
+        // 10 ^ (36 - underlying asset decimals)
+        priceOracle.setUnderlyingPrice(CToken(address(cUni)), 5e18);
+        // Reserve Factor : 0%
+        cUni._setReserveFactor(0);
+        // support cUni into Market
+        unitrollerProxy._supportMarket(CToken(address(cUni)));
+        // 設定 UNI 的 collateral factor 為 50%
+        unitrollerProxy._setCollateralFactor(CToken(address(cUni)), 0.5e18);
+    }
+
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address initiator,
+        bytes calldata params
+    ) external returns (bool) {
+        // 1250 USDC
+        console.log("liquidate amount: %s", amount);
+        IUSDC.approve(address(cUsdc), amount);
+        // liquidate user1's USDC get cUni
+        cUsdc.liquidateBorrow(user1, amount, cUni);
+        console.log("cUni balance: %s", cUni.balanceOf(address(this)));
+        // redeem cUni get Uni
+        cUni.redeem(cUni.balanceOf(address(this)));
+        console.log("Uni balance: %s", IUNI.balanceOf(address(this)));
+        // swap UNI for USDC
+        uint256 amtIn = IUNI.balanceOf(address(this));
+
+        IUNI.approve(address(SWAP_ROUTER), amtIn);
+
+        ISwapRouter.ExactInputSingleParams memory swapParams =
+        ISwapRouter.ExactInputSingleParams({
+            tokenIn: UNI,
+            tokenOut: USDC,
+            fee: 3000, // 0.3%
+            recipient: address(this),
+            deadline: block.timestamp,
+            amountIn: amtIn,
+            amountOutMinimum: 0,
+            sqrtPriceLimitX96: 0
+        });
+
+        // The call to `exactInputSingle` executes the swap.
+        uint256 amountOut = ISwapRouter(SWAP_ROUTER).exactInputSingle(swapParams);
+
+        // approve AAVE transfer amount + premium 0.05% USDC
+        EIP20Interface(asset).approve(address(POOL()), amount + premium);
+        return true;
+    }
+    
+    function ADDRESSES_PROVIDER() public view returns (IPoolAddressesProvider) {
+        return IPoolAddressesProvider(POOL_ADDRESSES_PROVIDER);
+    }
+
+    function POOL() public view returns (IPool) {
+        return IPool(ADDRESSES_PROVIDER().getPool());
     }
 }
